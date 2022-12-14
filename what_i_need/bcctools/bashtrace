@@ -1,0 +1,150 @@
+#!/usr/bin/python
+
+from __future__ import print_function
+from bcc import ArgString, BPF
+from bcc.utils import printb
+import argparse
+from datetime import datetime, timedelta
+import os
+
+# arguments
+epi = """
+It`s a bash trace system
+"""
+parser = argparse.ArgumentParser(
+    description="Trace open() syscalls",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=epi)
+
+#some helpful funcs
+parser.add_argument("-p", "--pid") #process id sniffer
+parser.add_argument("-t", "--tid") #thread id sniffer
+parser.add_argument("-u", "--uid") #user id sniffer
+parser.add_argument("-d", "--duration")# duration of file
+
+args = parser.parse_args()
+debug = 0
+if args.duration:
+    args.duration = timedelta(seconds=int(args.duration))
+
+
+# define BPF program
+bpf_text = """
+#include <uapi/linux/ptrace.h>
+#include <uapi/linux/limits.h>
+#include <linux/sched.h>
+
+struct val_t {
+    u64 id;
+    char comm[TASK_COMM_LEN];
+    const char *fname;
+    int flags; // EXTENDED_FLAGS
+};
+
+struct data_t {
+    u64 id;
+    u64 ts;
+    u32 uid;
+    int ret;
+    char comm[TASK_COMM_LEN];
+    char fname[NAME_MAX];
+    int flags; // EXTENDED_FLAGS
+};
+
+/*getting pid, tid, uid by bpf func-s*/
+int trace_entry(struct pt_regs *ctx, int dfd, const char __user *filename, int flags)
+{
+    struct val_t val = {};
+    u64 id = bpf_get_current_pid_tgid();
+    u32 pid = id >> 32; // PID is higher part of it
+    u32 tid = id;       // Cast and get the lower part of id
+    u32 uid = bpf_get_current_uid_gid();
+
+
+    if (bpf_get_current_comm(&val.comm, sizeof(val.comm)) == 0) {
+        val.id = id;
+        val.fname = filename;
+        val.flags = flags; // EXTENDED_FLAGS
+        infotmp.update(&id, &val);
+    }
+
+    return 0;
+};
+
+/*the result of some actrions tracing */
+int trace_return(struct pt_regs *ctx)
+{
+    u64 id = bpf_get_current_pid_tgid();
+    struct val_t *val;
+    struct data_t data = {};
+
+    u64 tsns = bpf_ktime_get_ns();
+
+    val = infotmp.lookup(&id);
+    if (val == 0) {
+        return 0;
+    }
+
+    bpf_probe_read(&data.comm, sizeof(data.comm), val->comm);
+    bpf_probe_read(&data.fname, sizeof(data.fname), (void *)val->fname);
+    data.id = val->id;
+    data.ts = tsns / 1000;
+    data.uid = bpf_get_current_uid_gid();
+    data.flags = val->flags; // EXTENDED_FLAGS
+    data.ret = PT_REGS_RC(ctx);
+
+    events.perf_submit(ctx, &data, sizeof(data));
+    infotmp.delete(&id);
+
+    return 0;
+}
+"""
+
+#checking for flags at the beginning of working
+if not (args.extended_fields or args.flag_filter):
+    bpf_text = '\n'.join(x for x in bpf_text.split('\n')
+        if 'EXTENDED_FLAGS' not in x)
+
+# initialization of BPF
+bpf_code = BPF(text=bpf_text)
+bpf_code.attach_kprobe(event="do_sys_open", fn_name="trace_entry")
+bpf_code.attach_kretprobe(event="do_sys_open", fn_name="trace_return")
+
+initial_ts = 0
+
+#output
+
+print("%-6s %-16s %4s %3s " %
+      ("TID" if args.tid else "PID", "COMM", "FD", "ERR"), end="")
+print("PATH")
+
+#process event
+def print_event(cpu, data, size):
+    event = bpf_code["events"].event(data)
+    global initial_ts
+
+    #split return value into FD
+    if event.ret >= 0:
+        fd_s = event.ret
+        err = 0
+    else:
+        fd_s = -1
+        err = - event.ret
+
+    if not initial_ts:
+        initial_ts = event.ts
+
+
+    printb(b"%-6d %-16s %4d %3d " %
+           (event.id & 0xffffffff if args.tid else event.id >> 32,
+            event.comm, fd_s, err), nl="")
+    printb(b'%s' % event.fname)
+
+#print event result
+bpf_code["events"].open_perf_buffer(print_event, page_cnt=64)
+start_time = datetime.now()
+while not args.duration or datetime.now() - start_time < args.duration:
+    try:
+        bpf_code.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()

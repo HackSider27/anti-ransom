@@ -1,0 +1,6 @@
+[submodule "bpftrace"]
+	path = bpftrace
+	url = https://github.com/iovisor/bpftrace
+[submodule "libbpf"]
+	path = libbpf
+	url = https://github.com/libbpf/libbpf

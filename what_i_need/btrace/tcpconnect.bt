@@ -1,0 +1,39 @@
+#!/usr/bin/env bpftrace
+
+#include <linux/socket.h>
+#include <net/sock.h>
+//#include <stdio.h>
+
+/*preparing print table*/
+BEGIN
+{
+  printf("Tracing tcp connections\n");
+  printf("%-8s %-8s %-16s ", "TIME", "PID", "COMM");
+  printf("%-40s %-8s %-40s %-8s\n", "SentADDR", "SentPORT", "DestADDR", "DestPORT");
+}
+
+kprobe:tcp_connect
+{
+  $socket = ((struct sock *) arg0);
+  $inet_family = $socket->__sk_common.skc_family; //identificate of group of family connection
+
+  if ($inet_family == AF_INET || $inet_family == AF_INET6) {
+  //checking of config ipv6 or not (destination address and source address)
+    if ($inet_family == AF_INET) {
+      $daddr = ntop($socket->__sk_common.skc_daddr);
+      $saddr = ntop($socket->__sk_common.skc_rcv_saddr);
+    } else {
+      $daddr = ntop($socket->__sk_common.skc_v6_daddr.in6_u.u6_addr8);
+      $saddr = ntop($socket->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8);
+    }
+    $lport = $socket->__sk_common.skc_num; //local port of current PC
+    $dport = $socket->__sk_common.skc_dport; //destination port
+
+    //Destination port is big endian, it must be flipped
+    $dport = ($dport >> 8) | (($dport << 8) & 0x00FF00);
+
+    time("%H:%M:%S ");
+    printf("%-8d %-16s ", pid, comm);
+    printf("%-40s %-8d %-40s %-8d\n", $saddr, $lport, $daddr, $dport);
+  }
+}

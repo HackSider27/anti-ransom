@@ -1,0 +1,14 @@
+#!/usr/bin/env bpftrace
+
+//start tracing and prepare the work
+BEGIN
+{
+	printf("Sampling CPU at 99hz... Hit Ctrl-C to end.\n");
+}
+
+//making gist of each process
+profile:hz:99
+/pid/
+{
+	@cpu = lhist(cpu, 0, 1000, 1);
+}

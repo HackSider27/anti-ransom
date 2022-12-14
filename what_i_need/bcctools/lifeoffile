@@ -1,0 +1,124 @@
+#!/usr/bin/python
+
+#It traces the creation and deletion of files, the file age, and the file name.
+
+#the next step of working here is  providing information
+#on who deleted the file!!!
+
+from __future__ import print_function
+from bcc import BPF
+import argparse
+from time import strftime
+
+#arguments example
+examples = """examples:
+    ./lifeoffile           # trace all stat() syscalls
+    ./lifeoffile -p 181    # only trace PID 181
+"""
+parser = argparse.ArgumentParser(
+    description="Trace stat() syscalls",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=examples)
+parser.add_argument("-p", "--pid", #current process id sniffer
+    help="trace this PID only")
+parser.add_argument("--ebpf", action="store_true", #info of using
+    help=argparse.SUPPRESS)
+args = parser.parse_args()
+debug = 0
+
+#define BPF program
+bpf_text = """
+#include <uapi/linux/ptrace.h>
+#include <linux/fs.h>
+#include <linux/sched.h>
+
+struct data_t {
+    u32 pid;
+    u64 delta;
+    char comm[16];
+    char fname[32];
+};
+
+BPF_HASH(creation, struct dentry *);
+BPF_PERF_OUTPUT(events);
+
+/*preraring for tracing*/
+int trace_create(struct pt_regs *ctx, struct inode *dir, struct dentry *dentry)
+{
+    u32 pid = bpf_get_current_pid_tgid(); //pid take
+    CUR_PID
+
+    u64 tsns = bpf_ktime_get_ns(); //time
+    creation.update(&dentry, &ts);
+
+    return 0;
+};
+
+/*trace file deletion and output details*/
+int trace(struct pt_regs *ctx, struct inode *dir, struct dentry *dentry)
+{
+    struct data_t data = {};
+    u32 pid = bpf_get_current_pid_tgid();
+
+    CUR_PID
+
+    u64 *tsp, delta;
+    tsp = creation.lookup(&dentry);
+    if (tsp == 0) {
+        return 0;   // missed creation
+    }
+
+    delta = (bpf_ktime_get_ns() - *tsp) / 1000000; //delte time openning
+    creation.delete(&dentry);
+
+    struct qstr d_name = dentry->d_name;
+    if (d_name.len == 0)
+        return 0;
+
+        /*check for good work and return info of tracing*/
+    if (bpf_get_current_comm(&data.comm, sizeof(data.comm)) == 0) {
+        data.pid = pid;
+        data.delta = delta;
+        bpf_probe_read(&data.fname, sizeof(data.fname), d_name.name);
+    }
+
+    events.perf_submit(ctx, &data, sizeof(data));
+
+    return 0;
+}
+"""
+
+#checking for established flags
+if args.pid:
+    bpf_text = bpf_text.replace('CUR_PID',
+        'if (pid != %s) { return 0; }' % args.pid)
+else:
+    bpf_text = bpf_text.replace('CUR_PID', '')
+
+#define file for res-s
+f = open('filetrace', 'a')
+
+#initialization BPF
+bpfcode = BPF(text=bpf_text)
+bpfcode.attach_kprobe(event="vfs_create", fn_name="trace_create")
+
+bpfcode.attach_kprobe(event="security_inode_create", fn_name="trace_create")
+bpfcode.attach_kprobe(event="vfs_unlink", fn_name="trace")
+
+#print the head of result
+f.write("%-6s %-16s %-7s %s\n" % ("PID", "COMM", "AGE(s)", "FILE"))
+
+#process event
+def print_step(cpu, data, size):
+    event = bpfcode["events"].event(data)
+    f.write("%-6d %-16s %-7.2f %s\n" % ( event.pid,
+        event.comm.decode('utf-8', 'replace'), float(event.delta) / 1000,
+        event.fname.decode('utf-8', 'replace')))
+
+bpfcode["events"].open_perf_buffer(print_step)
+while 1:
+    try:
+        bpfcode.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()
+        f.close()
